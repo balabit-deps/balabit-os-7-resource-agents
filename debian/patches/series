@@ -6,3 +6,4 @@ ocft-configs.patch
 xen-toolstack.patch
 gitignore.patch
 reproducible.patch
+SSBM-332-heartbeat.patch
