@@ -1,0 +1,22 @@
+Description: Use the toolstack selected in /etc/default/xen
+ Xen agent should use the configured toolstack and not prefer xl.
+ This patch can be dropped once there is only one supported toolstack.
+Author: Valentin Vidic <Valentin.Vidic@CARNet.hr>
+Bug: https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=854276
+Forwarded: not-needed
+Last-Update: 2017-08-03
+---
+This patch header follows DEP-3: http://dep.debian.net/deps/dep3/
+--- a/heartbeat/Xen
++++ b/heartbeat/Xen
+@@ -44,8 +44,8 @@
+ : ${OCF_RESKEY_allow_mem_management=0}
+ : ${OCF_RESKEY_reserved_Dom0_memory=512}
+ 
+-# prefer xl
+-xentool=$(which xl 2> /dev/null || which xm)
++# use /etc/default/xen
++xentool=$(/usr/lib/xen-common/bin/xen-toolstack)
+ 
+ meta_data() {
+ 	cat <<END
