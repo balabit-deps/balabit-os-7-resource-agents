@@ -1,0 +1,458 @@
+#!/bin/sh
+#
+# 
+# LVM
+#
+# Description:	Manages an LVM volume as an HA resource
+#
+#
+# Author:	Alan Robertson
+# Support:	users@clusterlabs.org
+# License:	GNU General Public License (GPL)
+# Copyright:	(C) 2002 - 2005 International Business Machines, Inc.
+#
+#	This code significantly inspired by the LVM resource
+#	in FailSafe by Lars Marowsky-Bree
+#
+#
+# An example usage in /etc/ha.d/haresources: 
+#			 node1	10.0.0.170 ServeRAID::1::1 LVM::myvolname
+#
+# See usage() function below for more details...
+#
+#		OCF parameters are as below:
+#		OCF_RESKEY_volgrpname
+#		
+#######################################################################
+# Initialization:
+
+: ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
+. ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+
+#######################################################################
+
+
+usage() {
+	methods=`LVM_methods`
+	methods=`echo $methods | tr ' ' '|'`
+	cat <<EOF
+	usage: $0 $methods
+
+	$0 manages an	Linux Volume Manager volume (LVM) as an HA resource
+
+	The 'start' operation brings the given volume online
+	The 'stop' operation takes the given volume offline
+	The 'status' operation reports whether the volume is available
+	The 'monitor' operation reports whether the volume seems present
+	The 'validate-all' operation checks whether the OCF parameters are valid
+	The 'meta-data' operation show meta data 
+	The 'methods' operation reports on the methods $0 supports
+
+EOF
+}
+
+meta_data() {
+	cat <<EOF
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="LVM">
+<version>1.0</version>
+
+<longdesc lang="en">
+Resource script for LVM. It manages an Linux Volume Manager volume (LVM) 
+as an HA resource. 
+</longdesc>
+<shortdesc lang="en">Controls the availability of an LVM Volume Group</shortdesc>
+
+<parameters>
+<parameter name="volgrpname" unique="1" required="1">
+<longdesc lang="en">
+The name of volume group.
+</longdesc>
+<shortdesc lang="en">Volume group name</shortdesc>
+<content type="string" default="" />
+</parameter>
+<parameter name="exclusive" unique="0" required="0">
+<longdesc lang="en">
+If set, the volume group will be activated exclusively.  This option works one of
+two ways.  If the volume group has the cluster attribute set, then the volume group
+will be activated exclusively using clvmd across the cluster.  If the cluster attribute
+is not set, the volume group will be activated exclusively using a tag and the volume_list 
+filter. When the tag option is in use, the volume_list in lvm.con must be initialized. This 
+can be as simple as setting 'volume_list = []' depending on your setup.
+</longdesc>
+<shortdesc lang="en">Exclusive activation</shortdesc>
+<content type="boolean" default="false" />
+</parameter>
+
+<parameter name="tag" unique="0" required="0">
+<longdesc lang="en">
+If "exclusive" is set on a non clustered volume group, this overrides the tag to be used.
+</longdesc>
+<shortdesc lang="en">Exclusive activation tag</shortdesc>
+<content type="string" default="pacemaker" />
+</parameter>
+
+<parameter name="partial_activation" unique="0" required="0">
+<longdesc lang="en">
+If set, the volume group will be activated partially even with some
+physical volumes missing. It helps to set to true when using mirrored
+logical volumes.
+</longdesc>
+<shortdesc lang="en">Activate VG partially when missing PVs</shortdesc>
+<content type="string" default="false" />
+</parameter>
+
+</parameters>
+
+<actions>
+<action name="start" timeout="30" />
+<action name="stop" timeout="30" />
+<action name="status" timeout="30" />
+<action name="monitor" depth="0" timeout="30" interval="10" />
+<action name="methods" timeout="5" />
+<action name="meta-data" timeout="5" />
+<action name="validate-all" timeout="5" />
+</actions>
+</resource-agent>
+EOF
+}
+
+#
+# methods: What methods/operations do we support?
+#
+LVM_methods() {
+	cat <<EOF
+	start
+	stop
+	status
+	monitor
+	methods
+	validate-all
+	meta-data
+	usage
+EOF
+}
+
+##
+#
+# plain = normal (non-exclusive) local activation
+# tag = tagged-exclusive activation
+# clvm = clvm-exclusive activation
+#
+# the mode specific implementation is in lvm-$mode.sh
+##
+
+set_lvm_mode() {
+	local mode
+
+	if ocf_is_true "$OCF_RESKEY_exclusive"; then
+		case $(vgs -o attr --noheadings $OCF_RESKEY_volgrpname | tr -d ' ') in
+		?????c*)
+			mode="clvm" ;;
+		*)
+			mode="tag" ;;
+		esac
+	else
+		mode="plain"
+	fi
+
+	. ${OCF_FUNCTIONS_DIR}/lvm-${mode}.sh
+}
+
+#
+#	Return LVM status (silently)
+#
+LVM_status() {
+	local rc=1
+	loglevel="debug"
+
+	# Set the log level of the error message
+	if [ "X${2}" = "X" ]; then
+		loglevel="err"
+		if ocf_is_probe; then
+			loglevel="warn"
+		else 
+			if [ ${OP_METHOD} = "stop" ]; then
+				loglevel="info"
+			fi
+		fi
+	fi
+	
+	if [ -d /dev/$1 ]; then
+		test "`cd /dev/$1 && ls`" != ""
+		rc=$?
+		if [ $rc -ne 0 ]; then
+			ocf_exit_reason "VG $1 with no logical volumes is not supported by this RA!"
+		fi
+	fi
+
+	if [ $rc -ne 0 ]; then
+		ocf_log $loglevel "LVM Volume $1 is not available (stopped)"
+		rc=$OCF_NOT_RUNNING
+	else
+		lvm_status
+		rc=$?
+	fi
+
+	if [ "X${2}" = "X" ]; then
+		# status call return
+		return $rc
+	fi
+
+	# Report on LVM volume status to stdout...
+	if [ $rc -eq 0 ]; then
+		echo "Volume $1 is available (running)"
+	else
+		echo "Volume $1 is not available (stopped)"
+	fi
+	return $rc
+}
+
+#
+#	Enable LVM volume
+#
+LVM_start() {
+	local vg=$1
+
+	# systemd drop-in to stop process before storage services during
+	# shutdown/reboot
+	if ps -p 1 | grep -q systemd ; then
+		systemd_drop_in "99-LVM" "After" "blk-availability.service"
+	fi
+
+	# TODO: This MUST run vgimport as well
+	ocf_log info "Activating volume group $vg"
+	if [ "$LVM_MAJOR" -eq "1" ]; then
+		ocf_run vgscan $vg
+	else
+		ocf_run vgscan
+	fi
+
+	lvm_pre_activate || exit
+	ocf_run vgchange $vgchange_activate_options $vg
+	lvm_post_activate $?
+
+	if LVM_status $vg; then
+		: OK Volume $vg activated just fine!
+		return $OCF_SUCCESS 
+	else
+		ocf_exit_reason "LVM: $vg did not activate correctly"
+		return $OCF_NOT_RUNNING
+	fi
+}
+
+#
+#	Disable the LVM volume
+#
+LVM_stop() {
+	local res=$OCF_ERR_GENERIC
+	local vg=$1
+
+	if ! vgs $vg > /dev/null 2>&1; then
+		ocf_log info "Volume group $vg not found"
+		return $OCF_SUCCESS
+	fi
+
+	ocf_log info "Deactivating volume group $vg"
+
+	lvm_pre_deactivate || exit
+
+	for i in $(seq 10)
+	do
+		ocf_run vgchange $vgchange_deactivate_options $vg
+		res=$?
+		if LVM_status $vg; then
+			ocf_exit_reason "LVM: $vg did not stop correctly"
+			res=1
+		fi
+
+		if [ $res -eq 0 ]; then
+			break
+		fi
+
+		res=$OCF_ERR_GENERIC
+		ocf_log warn "$vg still Active"
+		ocf_log info "Retry deactivating volume group $vg"
+		sleep 1
+		which udevadm > /dev/null 2>&1 && udevadm settle --timeout=5
+	done
+
+	lvm_post_deactivate $res
+}
+
+#
+#	Check whether the OCF instance parameters are valid
+#
+LVM_validate_all() {
+	check_binary $AWK
+
+	##
+	# lvmetad is a daemon that caches lvm metadata to improve the
+	# performance of LVM commands. This daemon should never be used when
+	# volume groups exist that are being managed by the cluster. The lvmetad
+	# daemon introduces a response lag, where certain LVM commands look like
+	# they have completed (like vg activation) when in fact the command
+	# is still in progress by the lvmetad.  This can cause reliability issues
+	# when managing volume groups in the cluster.  For Example, if you have a
+	# volume group that is a dependency for another application, it is possible
+	# the cluster will think the volume group is activated and attempt to start
+	# the application before volume group is really accesible... lvmetad is bad.
+	##
+	lvm dumpconfig global/use_lvmetad | grep 'use_lvmetad.*=.*1' > /dev/null 2>&1
+	if [ $? -eq 0 ]; then
+		# for now warn users that lvmetad is enabled and that they should disable it. In the
+		# future we may want to consider refusing to start, or killing the lvmetad daemon.
+		ocf_log warn "Disable lvmetad in lvm.conf. lvmetad should never be enabled in a clustered environment. Set use_lvmetad=0 and kill the lvmetad process"
+	fi
+	
+	##
+	# Off-the-shelf tests...
+	##
+	VGOUT=`vgck ${VOLUME} 2>&1`
+	if [ $? -ne 0 ]; then
+		# Inconsistency might be due to missing physical volumes, which doesn't 
+		# automatically mean we should fail.  If partial_activation=true then 
+		# we should let start try to handle it, or if no PVs are listed as
+		# "unknown device" then another node may have marked a device missing 
+		# where we have access to all of them and can start without issue. 
+		if vgs -o pv_attr --noheadings $OCF_RESKEY_volgrpname 2>/dev/null | grep 'm' > /dev/null 2>&1; then
+			case $(vgs -o attr --noheadings $OCF_RESKEY_volgrpname | tr -d ' ') in
+			???p??*)
+				if ! ocf_is_true "$OCF_RESKEY_partial_activation" ; then
+					# We are missing devices and cannot activate partially
+					ocf_exit_reason "Volume group [$VOLUME] has devices missing.  Consider partial_activation=true to attempt to activate partially"
+					exit $OCF_ERR_GENERIC
+				else
+					# We are missing devices but are allowed to activate partially. 
+					# Assume that caused the vgck failure and carry on
+					ocf_log warn "Volume group inconsistency detected with missing device(s) and partial_activation enabled.  Proceeding with requested action."
+				fi
+				;;
+			esac
+			# else the vg is partial but all devices are accounted for, so another 
+			# node must have marked the device missing.  Proceed.
+		else
+			# vgck failure was for something other than missing devices
+			ocf_exit_reason "Volume group [$VOLUME] does not exist or contains error! ${VGOUT}"
+			exit $OCF_ERR_GENERIC
+		fi
+	fi
+
+	##
+	# Does the Volume Group exist?
+	##
+	if [ "$LVM_MAJOR" = "1" ]; then
+		VGOUT=`vgdisplay ${VOLUME} 2>&1`
+	else
+		VGOUT=`vgdisplay -v ${VOLUME} 2>&1`
+	fi
+	if [ $? -ne 0 ]; then
+		ocf_exit_reason "Volume group [$VOLUME] does not exist or contains error! ${VGOUT}"
+		exit $OCF_ERR_GENERIC
+	fi
+
+	if lvs --noheadings -o segtype | grep -q "cache"; then
+		if ! lvs --noheadings -o cache_mode "$OCF_RESKEY_volgrpname" | grep -q "writethrough"; then
+			ocf_log warn "LVM CACHE IS NOT IN WRITETHROUGH MODE. THIS IS NOT A SUPPORTED CONFIGURATION."
+		fi
+	fi
+
+	if ocf_is_clone && ocf_is_true "$OCF_RESKEY_exclusive"; then
+		ocf_exit_reason "cloned lvm resources can not be activated exclusively"
+		exit $OCF_ERR_CONFIGURED
+	fi
+
+	lvm_validate_all
+}
+
+#
+#	'main' starts here...
+#
+
+if
+	[ $# -ne 1 ]
+then
+	usage
+	exit $OCF_ERR_ARGS 
+fi
+
+case $1 in
+	meta-data)	meta_data
+		exit $OCF_SUCCESS;;
+
+	methods)	LVM_methods
+		exit $?;;
+
+	usage)	usage
+		exit $OCF_SUCCESS;;
+	*)		;;
+esac
+
+if 
+	[ -z "$OCF_RESKEY_volgrpname" ]
+then
+	ocf_exit_reason "You must identify the volume group name!"
+	exit $OCF_ERR_CONFIGURED 
+fi
+
+# Get the LVM version number, for this to work we assume(thanks to panjiam):
+# 
+# LVM1 outputs like this
+#
+#	# vgchange --version
+#	vgchange: Logical Volume Manager 1.0.3
+#	Heinz Mauelshagen, Sistina Software	19/02/2002 (IOP 10)
+#
+# LVM2 and higher versions output in this format
+#
+#	# vgchange --version
+#	LVM version:		 2.00.15 (2004-04-19)
+#	Library version: 1.00.09-ioctl (2004-03-31)
+#	Driver version:	4.1.0
+
+LVM_VERSION=`vgchange --version 2>&1 | \
+	$AWK '/Logical Volume Manager/ {print $5"\n"; exit; }
+			 /LVM version:/ {printf $3"\n"; exit;}'`
+rc=$?
+
+if
+	( [ $rc -ne 0 ] || [ -z "$LVM_VERSION" ] )
+then
+	ocf_exit_reason "LVM: $1 could not determine LVM version. Try 'vgchange --version' manually and modify $0 ?"
+	exit $OCF_ERR_INSTALLED
+fi
+LVM_MAJOR="${LVM_VERSION%%.*}"
+
+VOLUME=$OCF_RESKEY_volgrpname
+OP_METHOD=$1
+
+set_lvm_mode
+lvm_init
+if ocf_is_true "$OCF_RESKEY_partial_activation" ; then
+	vgchange_activate_options="${vgchange_activate_options} --partial"
+fi
+
+# What kind of method was invoked?
+case "$1" in
+
+	start)
+		LVM_validate_all
+		LVM_start $VOLUME
+		exit $?;;
+
+	stop)	LVM_stop $VOLUME
+		exit $?;;
+
+	status)	LVM_status $VOLUME $1
+		exit $?;;
+
+	monitor)	LVM_status $VOLUME
+		exit $?;;
+
+	validate-all)	LVM_validate_all
+		;;
+
+	*)		usage
+		exit $OCF_ERR_UNIMPLEMENTED;;
+esac

@@ -1,0 +1,108 @@
+# iscsi
+
+CONFIG
+	Agent iscsi
+	AgentRoot /usr/lib/ocf/resource.d/heartbeat
+	InstallPackage open-iscsi targetcli
+	HangTimeout 20
+
+VARIABLE
+	OCFT_rundir="`get_rundir`"
+	OCFT_disk="$OCFT_rundir/resource-agents/ocft-iscsi"
+	OCFT_target="iqn.2003-01.org.linux-iscsi:ocft"
+	OCFT_portal="127.0.0.1:3260"
+	OCFT_loop="`loopbackeddev make $OCFT_disk 16M`"
+	OCF_RESKEY_iqn=$OCFT_target
+	OCF_RESKEY_portals=$OCFT_portal
+	OCF_RESKEY_target_iqn=$OCFT_target
+	OCF_RESKEY_path=$OCFT_loop
+	OCF_RESKEY_lun=1
+
+SETUP-AGENT
+	if systemctl list-unit-files 2>/dev/null | fgrep -q iscsid.service; then
+		systemctl start iscsid.service
+	else
+		/etc/init.d/open-iscsi start
+	fi
+	if systemctl list-unit-files 2>/dev/null | fgrep -q target.service; then
+		systemctl start target.service
+	else
+		/etc/init.d/target start
+	fi
+	export OCF_RESKEY_iqn=$OCFT_target
+	export OCF_RESKEY_portals=$OCFT_portal
+	export OCF_RESKEY_target_iqn=$OCFT_target
+	export OCF_RESKEY_path=$OCFT_loop
+	export OCF_RESKEY_lun=1
+	/usr/lib/ocf/resource.d/heartbeat/iSCSITarget start
+	/usr/lib/ocf/resource.d/heartbeat/iSCSILogicalUnit start
+
+CLEANUP-AGENT
+	export OCF_RESKEY_iqn=$OCFT_target
+	export OCF_RESKEY_portals=$OCFT_portal
+	export OCF_RESKEY_target_iqn=$OCFT_target
+	export OCF_RESKEY_path=$OCFT_loop
+	export OCF_RESKEY_lun=1
+	/usr/lib/ocf/resource.d/heartbeat/iSCSILogicalUnit stop
+	/usr/lib/ocf/resource.d/heartbeat/iSCSITarget stop
+	if systemctl list-unit-files 2>/dev/null | fgrep -q target.service; then
+		systemctl stop target.service
+	fi
+	loopbackeddev unmake $OCFT_disk
+
+CASE-BLOCK required_args
+	Env OCF_RESKEY_portal=$OCFT_portal
+	Env OCF_RESKEY_target=$OCFT_target
+
+CASE-BLOCK default_status
+	AgentRun stop
+
+CASE-BLOCK prepare
+	Include required_args
+	Include default_status
+
+CASE "check base env"
+	Include prepare
+	AgentRun start OCF_SUCCESS
+
+CASE "check base env: invalid 'OCF_RESKEY_portal'"
+	Include prepare
+	Unenv OCF_RESKEY_portal
+	AgentRun start OCF_ERR_CONFIGURED
+
+CASE "check base env: unset 'OCF_RESKEY_target'"
+	Include prepare
+	Unenv OCF_RESKEY_target
+	AgentRun start OCF_ERR_CONFIGURED
+
+CASE "normal start"
+	Include prepare
+	AgentRun start OCF_SUCCESS
+
+CASE "normal stop"
+	Include prepare
+	AgentRun start
+	AgentRun stop OCF_SUCCESS
+
+CASE "double start"
+	Include prepare
+	AgentRun start
+	AgentRun start OCF_SUCCESS
+
+CASE "double stop"
+	Include prepare
+	AgentRun stop OCF_SUCCESS
+
+CASE "monitor when running"
+	Include prepare
+	AgentRun start
+	AgentRun monitor OCF_SUCCESS
+
+CASE "monitor when not running"
+	Include prepare
+	AgentRun monitor OCF_NOT_RUNNING
+
+CASE "unimplemented command"
+	Include prepare
+	AgentRun no_cmd OCF_ERR_UNIMPLEMENTED
+

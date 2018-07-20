@@ -1,0 +1,449 @@
+#!/bin/sh
+# exportfs
+#
+# Description: Manages nfs exported file system.
+#
+#   (c) 2010 Ben Timby, Florian Haas, Dejan Muhamedagic,
+#            and Linux-HA contributors
+#
+# License: GNU General Public License v2 (GPLv2) and later
+
+#######################################################################
+# Initialization:
+: ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
+. ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+
+# Defaults
+OCF_RESKEY_unlock_on_stop_default=1
+OCF_RESKEY_wait_for_leasetime_on_stop_default=0
+OCF_RESKEY_rmtab_backup_default=".rmtab"
+
+: ${OCF_RESKEY_unlock_on_stop=${OCF_RESKEY_unlock_on_stop_default}}
+: ${OCF_RESKEY_wait_for_leasetime_on_stop=${OCF_RESKEY_wait_for_leasetime_on_stop_default}}
+: ${OCF_RESKEY_rmtab_backup=${OCF_RESKEY_rmtab_backup_default}}
+#######################################################################
+
+exportfs_meta_data() {
+	cat <<END
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="exportfs">
+<version>1.0</version>
+
+<longdesc lang="en">
+Exportfs uses the exportfs command to add/remove nfs exports.
+It does NOT manage the nfs server daemon.
+It depends on Linux specific NFS implementation details,
+so is considered not portable to other platforms yet.
+</longdesc>
+
+<shortdesc lang="en">
+Manages NFS exports
+</shortdesc>
+
+<parameters>
+
+<parameter name="clientspec" unique="0" required="1">
+<longdesc lang="en">
+The client specification allowing remote machines to mount the directory
+(or directories) over NFS.
+</longdesc>
+<shortdesc lang="en">
+Client ACL.
+</shortdesc>
+<content type="string" />
+</parameter>
+
+<parameter name="options" unique="0" required="0">
+<longdesc lang="en">
+The options to pass to exportfs for the exported directory
+or directories.
+</longdesc>
+<shortdesc lang="en">
+Export options.
+</shortdesc>
+<content type="string" />
+</parameter>
+
+<parameter name="directory" unique="0" required="1">
+<longdesc lang="en">
+The directory or directories to be exported using NFS. Multiple
+directories are separated by white space.
+</longdesc>
+<shortdesc lang="en">
+The directory or directories to export.
+</shortdesc>
+<content type="string" />
+</parameter>
+
+<parameter name="fsid" unique="1" required="1">
+<longdesc lang="en">
+The fsid option to pass to exportfs. This can be a unique positive
+integer, a UUID (assuredly sans comma characters), or the special string
+"root" which is functionally identical to numeric fsid of 0.
+If multiple directories are being exported, then they are
+assigned ids sequentially starting with this fsid (fsid, fsid+1,
+fsid+2, ...). Obviously, in that case the fsid must be an
+integer.
+0 (root) identifies the export as the root of an NFSv4
+pseudofilesystem -- avoid this setting unless you understand its
+special status.
+This value will override any fsid provided via the options parameter.
+</longdesc>
+<shortdesc lang="en">
+Unique fsid within cluster or starting fsid for multiple exports.
+</shortdesc>
+<content type="string" />
+</parameter>
+
+<parameter name="unlock_on_stop">
+<longdesc lang="en">
+Relinquish NFS locks associated with this filesystem when the resource
+stops. Enabling this parameter is highly recommended unless the path exported
+by this ${__SCRIPT_NAME} resource is also exported by a different resource.
+
+Note: Unlocking is only possible on Linux systems where
+/proc/fs/nfsd/unlock_filesystem exists and is writable. If your system does
+not fulfill this requirement (on account of having an nonrecent kernel,
+for example), you may set this parameter to 0 to silence the associated
+warning.
+</longdesc>
+<shortdesc lang="en">
+Unlock filesystem on stop?
+</shortdesc>
+<content type="boolean" default="${OCF_RESKEY_unlock_on_stop_default}" />
+</parameter>
+
+<parameter name="wait_for_leasetime_on_stop">
+<longdesc lang="en">
+When stopping (unexporting), wait out the NFSv4 lease time.
+Only after all leases have expired does the NFS kernel server
+relinquish all server-side handles on the exported filesystem.
+If this ${__SCRIPT_NAME} resource manages an export that resides
+on a mount point designed to fail over along with the NFS export
+itself, then enabling this parameter will ensure such failover
+is working properly. Note that when this parameter is set, your
+stop timeout MUST accommodate for the wait period. This parameter
+is safe to disable if none of your NFS clients are using NFS
+version 4 or later.
+</longdesc>
+<shortdesc lang="en">
+Ride out the NFSv4 lease time on resource stop?
+</shortdesc>
+<content type="boolean" default="${OCF_RESKEY_wait_for_leasetime_on_stop_default}" />
+</parameter>
+
+<parameter name="rmtab_backup">
+<longdesc lang="en">
+Back up those entries from the NFS rmtab that apply to the exported
+directory, to the specified backup file. The filename is interpreted
+as relative to the exported directory. This backup is required if
+clients are connecting to the export via NFSv3 over TCP. Note that a
+configured monitor operation is required for this functionality.
+
+To disable rmtab backups, set this parameter to the special
+string "none".
+</longdesc>
+<shortdesc lang="en">
+Location of the rmtab backup, relative to directory.
+</shortdesc>
+<content type="string" default="${OCF_RESKEY_rmtab_backup_default}" />
+</parameter>
+</parameters>
+
+<actions>
+<action name="start"   timeout="40" />
+<action name="stop"    timeout="120" />
+<action name="monitor" depth="0"  timeout="20" interval="10" />
+<action name="meta-data"  timeout="5" />
+<action name="validate-all"  timeout="30" />
+</actions>
+</resource-agent>
+END
+
+return $OCF_SUCCESS
+}
+
+exportfs_methods() {
+  cat <<-EOF
+	start
+	stop
+	status
+	monitor
+	validate-all
+	methods
+	meta-data
+	usage
+	EOF
+}
+
+reset_fsid() {
+	CURRENT_FSID=$OCF_RESKEY_fsid
+}
+bump_fsid() {
+	CURRENT_FSID=$((CURRENT_FSID+1))
+}
+get_fsid() {
+	echo $CURRENT_FSID
+}
+
+# run a function on all directories
+forall() {
+	local func=$1
+	shift 1
+	local fast_exit=""
+	local dir rc=0
+	if [ "$2" = fast_exit ]; then
+		fast_exit=1
+		shift 1
+	fi
+	reset_fsid
+	for dir in $OCF_RESKEY_directory; do
+		$func $dir "$@"
+		rc=$(($rc | $?))
+		[ $NUMDIRS -gt 1 ] && bump_fsid
+		[ "$fast_exit" ] && continue
+		[ $rc -ne 0 ] && return $rc
+	done
+	return $rc
+}
+
+backup_rmtab() {
+	local dir=$1
+	local rmtab_backup
+	rmtab_backup="$dir/${OCF_RESKEY_rmtab_backup}"
+	grep ":$dir:" /var/lib/nfs/rmtab > ${rmtab_backup}
+}
+
+restore_rmtab() {
+	local dir=$1
+	local rmtab_backup
+	rmtab_backup="$dir/${OCF_RESKEY_rmtab_backup}"
+	if [ -r ${rmtab_backup} ]; then
+		local tmpf=`mktemp`
+		sort -u ${rmtab_backup} /var/lib/nfs/rmtab > $tmpf &&
+		install -o root -m 644 $tmpf /var/lib/nfs/rmtab
+		rm -f $tmpf
+		ocf_log debug "Restored `wc -l ${rmtab_backup}` rmtab entries from ${rmtab_backup}."
+	else
+		ocf_log warn "rmtab backup ${rmtab_backup} not found or not readable."
+	fi
+}
+
+exportfs_usage() {
+	cat <<END
+		usage: $0 {start|stop|monitor|status|validate-all|meta-data}
+END
+}
+
+format_exports() {
+	# exportfs output wraps lines for long export directory names.
+	# We unwrap here with sed.
+	# We then do a literal match on the full line (grep -x -F)
+	exportfs |
+		sed -e '$! N; s/\n[[:space:]]\+/ /; t; s/[[:space:]]\+\([^[:space:]]\+\)\(\n\|$\)/ \1\2/g; P;D;'
+}
+is_exported() {
+	local dir=$1
+	local spec=$2
+	local rc
+	format_exports | grep -q -x -F "$dir $spec"
+	rc=$?
+	if [ $rc -ne 0 -a "$spec" = "*" ]; then
+		# on some platforms, exportfs may print
+		# "<world>" instead of "*"
+		format_exports | grep -q -x -F "$dir <world>"
+		rc=$?
+	fi
+	# log something only for monitors
+	if [ $rc -ne 0 -a "$__OCF_ACTION" = "monitor" ]; then
+		local sev="info"
+		ocf_is_probe || sev="err"
+		ocf_log $sev "$dir not exported to $spec (stopped)."
+	fi
+	return $rc
+}
+
+exportfs_monitor ()
+{
+	local spec
+
+	if ! ha_pseudo_resource "${OCF_RESOURCE_INSTANCE}" monitor; then
+		return $OCF_NOT_RUNNING
+	fi
+
+	spec="$(echo "$OCF_RESKEY_clientspec" | sed -e 's/^\[*//' -e 's/\]*$//')"
+	if forall is_exported "$spec"; then
+		if [ ${OCF_RESKEY_rmtab_backup} != "none" ]; then
+			forall backup_rmtab
+		fi
+		return $OCF_SUCCESS
+	else
+		return $OCF_NOT_RUNNING
+	fi
+}
+
+export_one() {
+	local dir=$1
+	local opts sep
+	sep=""
+	if [ -n "$OCF_RESKEY_options" ]; then
+		opts="$OCF_RESKEY_options"
+		sep=","
+	fi
+	if echo "$opts" | grep fsid >/dev/null; then
+		#replace fsid in options list
+		opts=`echo "$opts" | sed "s,fsid=[^,]*,fsid=$(get_fsid),g"`
+	else
+		#tack the fsid option onto our options list.
+		opts="${opts}${sep}fsid=$(get_fsid)"
+	fi
+	opts="-o $opts"
+
+	# if any of directories fails to export we can exit
+	# immediately
+	ocf_run exportfs -v $opts "${OCF_RESKEY_clientspec}:$dir"
+	if [ $? -ne 0 ]; then
+		ocf_exit_reason "exportfs failed - exportfs -v $opts ${OCF_RESKEY_clientspec}:$dir"
+		exit $OCF_ERR_GENERIC
+	fi
+
+	ocf_log info "directory $dir exported"
+	return $OCF_SUCCESS
+}
+exportfs_start ()
+{
+	if exportfs_monitor; then
+		ocf_log debug "already exported"
+		return $OCF_SUCCESS
+	fi
+	ocf_log info "Exporting file system(s) ..."
+
+	ha_pseudo_resource "${OCF_RESOURCE_INSTANCE}" start
+	forall export_one
+
+	# Restore the rmtab to ensure smooth NFS-over-TCP failover
+	if [ ${OCF_RESKEY_rmtab_backup} != "none" ]; then
+		forall restore_rmtab
+	fi
+}
+
+unlock_fs() {
+	local dir=$1
+	local unlockfile
+	unlockfile=/proc/fs/nfsd/unlock_filesystem
+	if [ -w ${unlockfile} ]; then
+		echo "$dir" > ${unlockfile}
+		ocf_log info "Unlocked NFS export $dir"
+	else
+		ocf_log warn "Unable to unlock NFS export $dir, ${unlockfile} not found or not writable"
+	fi
+}
+wait_for_leasetime() {
+	local leasetimefile
+	local sleeptime
+	leasetimefile=/proc/fs/nfsd/nfsv4leasetime
+	if [ -r ${leasetimefile} ]; then
+		sleeptime=$((`cat ${leasetimefile}`+2))
+		ocf_log info "Sleeping ${sleeptime} seconds to accommodate for NFSv4 lease expiry"
+		sleep ${sleeptime}s
+	else
+		ocf_log warn "Unable to read NFSv4 lease time from ${leasetimefile}, file not found or not readable"
+	fi
+}
+cleanup_export_cache() {
+	# see if the cache is blocking unexport
+	local contentfile=/proc/net/rpc/nfsd.export/content
+	local fsid_re
+	local i=1
+	fsid_re="fsid=(echo `forall get_fsid`|sed 's/ /|/g'),"
+	while :; do
+		grep -E -q "$fsid_re" $contentfile ||
+			break
+		ocf_log info "Cleanup export cache ... (try $i)"
+		ocf_run exportfs -f
+		sleep 0.5
+		i=$((i + 1))
+	done
+}
+unexport_one() {
+	local dir=$1
+	ocf_run exportfs -v -u ${OCF_RESKEY_clientspec}:$dir
+}
+exportfs_stop ()
+{
+	local rc
+
+	exportfs_monitor
+	if [ $? -eq $OCF_NOT_RUNNING ]; then
+		ocf_log debug "not exported"
+		return $OCF_SUCCESS
+	fi
+
+	ocf_log info "Un-exporting file system ..."
+
+	# Backup the rmtab to ensure smooth NFS-over-TCP failover
+	if [ ${OCF_RESKEY_rmtab_backup} != "none" ]; then
+		forall backup_rmtab
+	fi
+
+	forall unexport_one
+	rc=$?
+
+	if ocf_is_true ${OCF_RESKEY_unlock_on_stop}; then
+		forall unlock_fs
+	fi
+
+	if ocf_is_true ${OCF_RESKEY_wait_for_leasetime_on_stop}; then
+		wait_for_leasetime
+	fi
+
+	if [ $rc -eq 0 ]; then
+		cleanup_export_cache
+		ha_pseudo_resource "${OCF_RESOURCE_INSTANCE}" stop
+
+		ocf_log info "Un-exported file system(s)"
+		return $OCF_SUCCESS
+	else
+		ocf_exit_reason "Failed to un-export file system(s)"
+		return $OCF_ERR_GENERIC
+	fi
+}
+
+testdir() {
+	if [ ! -d $1 ]; then
+		ocf_is_probe ||
+			ocf_log err "$1 does not exist or is not a directory"
+		return 1
+	fi
+	return 0
+}
+exportfs_validate_all ()
+{
+	if echo "$OCF_RESKEY_fsid" | grep -q -F ','; then
+		ocf_exit_reason "$OCF_RESKEY_fsid cannot contain a comma"
+		return $OCF_ERR_CONFIGURED
+	fi
+	if [ $NUMDIRS -gt 1 ] &&
+			! ocf_is_decimal "$OCF_RESKEY_fsid"; then
+		ocf_exit_reason "use integer fsid when exporting multiple directories"
+		return $OCF_ERR_CONFIGURED
+	fi
+	if ! forall testdir; then
+		return $OCF_ERR_INSTALLED
+	fi
+}
+
+# If someone puts a trailing slash at the end of the export directory,
+# this agent is going to fail in some unexpected ways due to how
+# export strings are matched.  The simplest solution here is to strip off
+# a trailing '/' in the directory before processing anything.
+newdir=$(echo "$OCF_RESKEY_directory" | sed -n -e 's/^\(.*\)\/$/\1/p')
+if [ -n "$newdir" ]; then
+	OCF_RESKEY_directory=$newdir
+fi
+
+NUMDIRS=`echo "$OCF_RESKEY_directory" | wc -w`
+OCF_REQUIRED_PARAMS="directory fsid clientspec"
+OCF_REQUIRED_BINARIES="exportfs"
+ocf_rarun $*

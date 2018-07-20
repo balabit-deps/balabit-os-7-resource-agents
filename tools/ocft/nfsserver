@@ -1,0 +1,69 @@
+# nfsserver
+
+CONFIG
+	Agent nfsserver
+	AgentRoot /usr/lib/ocf/resource.d/heartbeat
+	InstallPackage nfs-kernel-server
+	HangTimeout 20
+
+SETUP-AGENT
+	INITSCRIPT=""
+	if test -f /etc/init.d/nfsserver; then
+		INITSCRIPT="/etc/init.d/nfsserver"
+	fi
+	true
+
+CASE-BLOCK required_args
+	Env OCF_RESKEY_nfs_init_script=$INITSCRIPT
+
+CASE-BLOCK default_status
+	AgentRun stop
+
+CASE-BLOCK prepare
+	Include required_args
+	Include default_status
+
+CASE "check base env"
+	Include prepare
+	AgentRun start OCF_SUCCESS
+
+CASE "check base env: invalid 'OCF_RESKEY_nfs_init_script'"
+	Include prepare
+	Env OCF_RESKEY_nfs_init_script=no_such_script
+	AgentRun start OCF_ERR_INSTALLED
+
+CASE "check base env: invalid 'OCF_RESKEY_nfs_notify_cmd'"
+	Include prepare
+	Env OCF_RESKEY_nfs_notify_cmd=no_such_program
+	AgentRun start OCF_ERR_INSTALLED
+
+CASE "normal start"
+	Include prepare
+	AgentRun start OCF_SUCCESS
+
+CASE "normal stop"
+	Include prepare
+	AgentRun start
+	AgentRun stop OCF_SUCCESS
+
+CASE "double start"
+	Include prepare
+	AgentRun start
+	AgentRun start OCF_SUCCESS
+
+CASE "double stop"
+	Include prepare
+	AgentRun stop OCF_SUCCESS
+
+CASE "monitor with running"
+	Include prepare
+	AgentRun start
+	AgentRun monitor OCF_SUCCESS
+
+CASE "monitor with not running"
+	Include prepare
+	AgentRun monitor OCF_NOT_RUNNING
+
+CASE "unimplemented command"
+	Include prepare
+	AgentRun no_cmd OCF_ERR_UNIMPLEMENTED

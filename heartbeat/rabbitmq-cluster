@@ -1,0 +1,549 @@
+#!/bin/sh
+#
+# Copyright (c) 2014 David Vossel <davidvossel@gmail.com>
+#                    All Rights Reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of version 2 of the GNU General Public License as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it would be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+#
+# Further, this software is distributed without any warranty that it is
+# free of the rightful claim of any third person regarding infringement
+# or the like.  Any license provided herein, whether implied or
+# otherwise, applies only to this software file.  Patent licenses, if
+# any, provided herein do not apply to combinations of this program with
+# other software, or any other product whatsoever.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write the Free Software Foundation,
+# Inc., 59 Temple Place - Suite 330, Boston MA 02111-1307, USA.
+#
+
+#######################################################################
+# Initialization:
+
+: ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
+. ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+
+#######################################################################
+
+RMQ_SERVER=/usr/sbin/rabbitmq-server
+RMQ_CTL=/usr/sbin/rabbitmqctl
+RMQ_DATA_DIR="/var/lib/rabbitmq/mnesia"
+RMQ_PID_DIR="/var/run/rabbitmq"
+RMQ_PID_FILE="/var/run/rabbitmq/rmq.pid"
+RMQ_LOG_DIR="/var/log/rabbitmq"
+NODENAME=$(ocf_attribute_target)
+
+# this attr represents the current active local rmq node name.
+# when rmq stops or the node is fenced, this attr disappears
+RMQ_CRM_ATTR_COOKIE="rmq-node-attr-${OCF_RESOURCE_INSTANCE}"
+# this attr represents the last known active local rmq node name
+# when rmp stops or the node is fenced, the attr stays forever so
+# we can continue to map an offline pcmk node to it's rmq node name
+# equivalent. 
+RMQ_CRM_ATTR_COOKIE_LAST_KNOWN="rmq-node-attr-last-known-${OCF_RESOURCE_INSTANCE}"
+
+meta_data() {
+	cat <<END
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="rabbitmq-cluster">
+<version>1.0</version>
+
+<longdesc lang="en">
+Starts cloned rabbitmq cluster instance. NB: note that this RA
+cannot be spawned across a mix of pacemaker and pacemaker-remote nodes.
+Only on pacemaker *or* pacemaker-remote nodes exclusively.
+</longdesc>
+<shortdesc lang="en">rabbitmq clustered</shortdesc>
+
+<parameters>
+<parameter name="set_policy" unique="1">
+<longdesc lang="en">
+Policy string to pass to 'rabbitmqctl set_policy' right after bootstrapping the first rabbitmq instance.
+</longdesc>
+<shortdesc lang="en">rabbitmqctl set_policy args</shortdesc>
+<content type="string" default="" />
+</parameter>
+
+</parameters>
+
+<actions>
+<action name="start"        timeout="100" />
+<action name="stop"         timeout="90" />
+<action name="monitor"      timeout="40" interval="10" depth="0" />
+<action name="meta-data"    timeout="10" />
+<action name="validate-all"   timeout="20" />
+</actions>
+</resource-agent>
+END
+}
+
+#######################################################################
+
+rmq_usage() {
+	cat <<END
+usage: $0 {start|stop|monitor|notify|validate-all|meta-data}
+
+Expects to have a fully populated OCF RA-compliant environment set.
+END
+}
+
+rmq_wipe_data()
+{
+	rm -rf $RMQ_DATA_DIR > /dev/null 2>&1 
+}
+
+rmq_local_node()
+{
+
+	local node_name=$($RMQ_CTL status 2>&1 | sed -n -e "s/^.*[S|s]tatus of node \(.*\)\s.*$/\1/p" | tr -d "'")
+
+	if [ -z "$node_name" ]; then
+		node_name=$(cat /etc/rabbitmq/rabbitmq-env.conf 2>/dev/null | grep "\s*RABBITMQ_NODENAME=" | awk -F= '{print $2}')
+	fi
+
+	echo "$node_name"
+}
+
+rmq_join_list()
+{
+	local join_list=$(cibadmin -Q --xpath "//node_state[@crmd='online']//nvpair[@name='$RMQ_CRM_ATTR_COOKIE']" | grep "$RMQ_CRM_ATTR_COOKIE" | sed -n -e "s/^.*value=.\(.*\)\".*$/\1/p")
+	# If join_list is empty we want to check if there are any remote nodes
+	# where rabbitmq is allowed to run (i.e. nodes without the crmd=online selector)
+	if [ -z "$join_list" ]; then
+		# Get all the nodes written in the ATTR_COOKIE no matter if
+		# they are online or not. This will be one line per node like
+		# rabbit@overcloud-rabbit-0
+		# rabbit@overcloud-rabbit-1
+		# ...
+		local remote_join_list=$(cibadmin -Q --xpath "//node_state//nvpair[@name='$RMQ_CRM_ATTR_COOKIE']" | grep "$RMQ_CRM_ATTR_COOKIE" | sed -n -e "s/^.*value=.\(.*\)\".*$/\1/p")
+		# The following expression prepares a filter like '-e overcloud-rabbit-0 -e overcloud-rabbit-1 -e ...'
+		local filter=$(crm_mon -r --as-xml | xmllint --format --xpath "//nodes//node[@online='true' and @standby='false']/@name" - | xargs -n1 echo | awk -F= '{print "-e "$2}')
+		# export the intersection which gives us only the nodes that
+		# a) wrote their namein the cib attrd
+		# b) run on nodes where pacemaker_remote is enabled
+		join_list="$(echo $remote_join_list | grep $filter)"
+	fi
+
+	echo $join_list
+}
+
+rmq_write_nodename()
+{
+	local node_name=$(rmq_local_node)
+
+	if [ -z "$node_name" ]; then
+		ocf_log err "Failed to determine rabbitmq node name, exiting"
+		exit $OCF_ERR_GENERIC
+	fi
+
+	# store the pcmknode to rmq node mapping as a transient attribute. This allows
+	# us to retrieve the join list with a simple xpath.
+	${HA_SBIN_DIR}/crm_attribute -N $NODENAME -l reboot --name "$RMQ_CRM_ATTR_COOKIE" -v "$node_name"
+
+	# the pcmknode to rmq node mapping as a permanent attribute as well. this lets
+	# us continue to map offline nodes to their equivalent rmq node name
+	${HA_SBIN_DIR}/crm_attribute -N $NODENAME -l forever --name "$RMQ_CRM_ATTR_COOKIE_LAST_KNOWN" -v "$node_name"
+}
+
+rmq_delete_nodename()
+{
+	# remove node-name
+	${HA_SBIN_DIR}/crm_attribute -N $NODENAME -l reboot --name "$RMQ_CRM_ATTR_COOKIE" -D
+}
+
+prepare_dir () {
+	if [ ! -d ${1} ] ; then
+		mkdir -p ${1}
+		chown -R rabbitmq:rabbitmq ${1}
+		chmod 755 ${1}
+	fi
+}
+
+remove_pid () {
+	rm -f ${RMQ_PID_FILE} > /dev/null 2>&1
+}
+
+rmq_monitor() {
+	local rc
+
+	$RMQ_CTL cluster_status > /dev/null 2>&1
+	rc=$?
+	case "$rc" in
+	0)
+		ocf_log debug "RabbitMQ server is running normally"
+		rmq_write_nodename
+		
+		return $OCF_SUCCESS
+	;;
+	2|68|69|70|75|78)
+		ocf_log info "RabbitMQ server is not running"
+		rmq_delete_nodename
+		return $OCF_NOT_RUNNING
+	;;
+	*)
+		ocf_log err "Unexpected return code from '$RMQ_CTL cluster_status' exit code: $rc"
+		rmq_delete_nodename
+		return $OCF_ERR_GENERIC
+	;;
+	esac
+}
+
+rmq_init_and_wait()
+{
+	local rc
+
+	prepare_dir $RMQ_PID_DIR
+	prepare_dir $RMQ_LOG_DIR
+	remove_pid
+
+	# the server startup script uses this environment variable
+	export RABBITMQ_PID_FILE="$RMQ_PID_FILE"
+
+	setsid sh -c "$RMQ_SERVER > ${RMQ_LOG_DIR}/startup_log 2> ${RMQ_LOG_DIR}/startup_err" &
+
+	ocf_log info "Waiting for server to start"
+	$RMQ_CTL wait $RMQ_PID_FILE
+	rc=$?
+	if [ $rc -ne $OCF_SUCCESS ]; then
+		remove_pid
+		ocf_log info "rabbitmq-server start failed: $rc"
+		return $OCF_ERR_GENERIC
+	fi
+
+	rmq_monitor
+	return $?
+}
+
+rmq_set_policy()
+{
+	$RMQ_CTL set_policy "$@" > /dev/null 2>&1
+}
+
+rmq_start_first()
+{
+	local rc
+
+	ocf_log info "Bootstrapping rabbitmq cluster"
+	rmq_wipe_data
+	rmq_init_and_wait
+	rc=$?
+
+	if [ $rc -eq 0 ]; then
+		rc=$OCF_SUCCESS
+		ocf_log info "cluster bootstrapped"
+
+		if [ -n "$OCF_RESKEY_set_policy" ]; then
+			# do not quote set_policy, we are passing in arguments
+			rmq_set_policy $OCF_RESKEY_set_policy > /dev/null 2>&1
+			if [ $? -ne 0 ]; then
+				ocf_log err "Failed to set policy: $OCF_RESKEY_set_policy"
+				rc=$OCF_ERR_GENERIC
+			else 
+				ocf_log info "Policy set: $OCF_RESKEY_set_policy"
+			fi
+		fi
+
+	else
+		ocf_log info "failed to bootstrap cluster. Check SELINUX policy"
+		rc=$OCF_ERR_GENERIC
+	fi
+
+	return $rc
+}
+
+rmq_is_clustered()
+{
+    $RMQ_CTL eval 'rabbit_mnesia:is_clustered().' | grep -q true
+}
+
+rmq_join_existing()
+{
+	local join_list="$1"
+	local rc=$OCF_ERR_GENERIC
+
+	ocf_log info "Joining existing cluster with [ $(echo $join_list | tr '\n' ' ') ] nodes."
+	rmq_init_and_wait
+	if [ $? -ne 0 ]; then
+		return $OCF_ERR_GENERIC
+	fi
+
+        if rmq_is_clustered; then
+            ocf_log info "Successfully re-joined existing rabbitmq cluster automatically"
+            return $OCF_SUCCESS
+        fi
+
+	# unconditionally join the cluster
+	$RMQ_CTL stop_app > /dev/null 2>&1
+	for node in $(echo "$join_list"); do
+		ocf_log info "Attempting to join cluster with target node $node"
+		$RMQ_CTL join_cluster $node
+		if [ $? -eq 0 ]; then
+			ocf_log info "Joined cluster by connecting to node $node, starting app"
+			$RMQ_CTL start_app
+			rc=$?
+			if [ $rc -ne 0 ]; then
+				ocf_log err "'$RMQ_CTL start_app' failed"
+			fi
+			break;
+		fi
+	done
+
+	if [ "$rc" -ne 0 ]; then
+		ocf_log info "Join process incomplete, shutting down."
+		return $OCF_ERR_GENERIC
+	fi
+
+	ocf_log info "Successfully joined existing rabbitmq cluster"
+	return $OCF_SUCCESS
+}
+
+rmq_forget_cluster_node_remotely() {
+	local running_cluster_nodes="$1"
+	local node_to_forget="$2"
+
+	ocf_log info "Forgetting $node_to_forget via nodes [ $(echo $running_cluster_nodes | tr '\n' ' ') ]."
+	for running_cluster_node in $running_cluster_nodes; do
+		$RMQ_CTL -n $running_cluster_node forget_cluster_node $node_to_forget
+		if [ $? = 0 ]; then
+			ocf_log info "Succeeded forgetting $node_to_forget via $running_cluster_node."
+			return
+		else
+			ocf_log err "Failed to forget node $node_to_forget via $running_cluster_node."
+		fi
+	done
+}
+
+rmq_notify() {
+	node_list="${OCF_RESKEY_CRM_meta_notify_stop_uname}"
+	mode="${OCF_RESKEY_CRM_meta_notify_type}-${OCF_RESKEY_CRM_meta_notify_operation}"
+
+
+	# When notifications are on, this agent is going to "forget" nodes once they
+	# leave the cluster. This is thought to resolve some issues where rabbitmq
+	# blocks trying to sync with an offline node after a fencing action occurs.
+	if ! [ "${mode}" = "post-stop" ]; then
+		return $OCF_SUCCESS
+	fi
+
+	rmq_monitor
+	if [ $? -ne $OCF_SUCCESS ]; then
+		# only run forget when we are for sure active 
+		return $OCF_SUCCESS
+	fi
+
+	# forget each stopped rmq instance in the provided pcmk node in the list.
+	for node in $(echo "$node_list"); do
+		local rmq_node="$(${HA_SBIN_DIR}/crm_attribute -N $(ocf_attribute_target $node) -l forever --query --name $RMQ_CRM_ATTR_COOKIE_LAST_KNOWN -q)"
+		if [ -z "$rmq_node" ]; then
+			ocf_log warn "Unable to map pcmk node $node to a known rmq node."
+			continue	
+		fi
+		ocf_log notice "Forgetting stopped node $rmq_node"
+		$RMQ_CTL forget_cluster_node $rmq_node
+		if [ $? -ne 0 ]; then
+			ocf_log warn "Unable to forget offline node $rmq_node."
+		fi
+	done
+	return $OCF_SUCCESS
+}
+
+rmq_start() {
+	local join_list=""
+	local rc
+
+	rmq_monitor
+	if [ $? -eq $OCF_SUCCESS ]; then
+		return $OCF_SUCCESS
+	fi
+
+	join_list=$(rmq_join_list)
+
+	# No join list means no active instances are up. This instance
+	# is the first, so it needs to bootstrap the rest
+	if [ -z "$join_list" ]; then
+		rmq_start_first
+		rc=$?
+		return $rc
+	fi
+
+	# Try to join existing cluster
+	ocf_log info "wiping data directory before joining"
+	local local_rmq_node="$(${HA_SBIN_DIR}/crm_attribute -N $NODENAME -l forever --query --name $RMQ_CRM_ATTR_COOKIE_LAST_KNOWN -q)"
+
+	rmq_stop
+	rmq_wipe_data
+	rmq_forget_cluster_node_remotely "$join_list" "$local_rmq_node"
+	rmq_join_existing "$join_list"
+	rc=$?
+
+	if [ $rc -ne 0 ]; then
+		ocf_log info "node failed to join even after reseting local data. Check SELINUX policy"
+		return $OCF_ERR_GENERIC
+	fi
+
+	# Restore users, user permissions, and policies (if any)
+	BaseDataDir=`dirname $RMQ_DATA_DIR`
+	$RMQ_CTL eval "
+		%% Run only if Mnesia is ready.
+		lists:any(fun({mnesia,_,_}) -> true; ({_,_,_}) -> false end, application:which_applications()) andalso
+		begin
+			Restore = fun(Table, PostprocessFun, Filename) ->
+				case file:consult(Filename) of
+					{error, _} ->
+						ok;
+					{ok, [Result]} ->
+						lists:foreach(fun(X) -> mnesia:dirty_write(Table, PostprocessFun(X)) end, Result),
+						file:delete(Filename)
+				end
+			end,
+
+			%% Restore users
+
+			Upgrade = fun
+				({internal_user, A, B, C}) -> {internal_user, A, B, C, rabbit_password_hashing_md5};
+				({internal_user, A, B, C, D}) -> {internal_user, A, B, C, D}
+			end,
+
+			Downgrade = fun
+				({internal_user, A, B, C}) -> {internal_user, A, B, C};
+				({internal_user, A, B, C, rabbit_password_hashing_md5}) -> {internal_user, A, B, C};
+				%% Incompatible scheme, so we will loose user's password ('B' value) during conversion.
+				%% Unfortunately, this case will require manual intervention - user have to run:
+				%%    rabbitmqctl change_password <A> <somenewpassword>
+				({internal_user, A, B, C, _}) -> {internal_user, A, B, C}
+			end,
+
+			%% Check db scheme first
+			[WildPattern] = ets:select(mnesia_gvar, [ { {{rabbit_user, wild_pattern}, '\\\$1'}, [], ['\\\$1'] } ]),
+			case WildPattern of
+				%% Version < 3.6.0
+				{internal_user,'_','_','_'} ->
+					Restore(rabbit_user, Downgrade, \"$BaseDataDir/users.erl\");
+				%% Version >= 3.6.0
+				{internal_user,'_','_','_','_'} ->
+					Restore(rabbit_user, Upgrade, \"$BaseDataDir/users.erl\")
+			end,
+
+			NoOp = fun(X) -> X end,
+
+			%% Restore user permissions
+			Restore(rabbit_user_permission, NoOp, \"$BaseDataDir/users_perms.erl\"),
+
+			%% Restore policies
+			Restore(rabbit_runtime_parameters, NoOp, \"$BaseDataDir/policies.erl\")
+		end.
+	"
+	return $OCF_SUCCESS
+}
+
+rmq_stop() {
+	# Backup users, user permissions, and policies
+	BaseDataDir=`dirname $RMQ_DATA_DIR`
+	$RMQ_CTL eval "
+		%% Run only if Mnesia is still available.
+		lists:any(fun({mnesia,_,_}) -> true; ({_,_,_}) -> false end, application:which_applications()) andalso
+		begin
+			Backup = fun(Table, SelectPattern, Filter, Filename) ->
+				Result = case catch mnesia:dirty_select(Table, [{SelectPattern, [Filter], ['\\\$_']}]) of
+					{'EXIT', _} -> [];
+					Any -> Any
+				end,
+				Result /= [] andalso file:write_file(Filename, io_lib:fwrite(\"~p.~n\", [Result]))
+			end,
+
+			%% Backup users
+			%% Check db scheme first
+			[WildPattern] = ets:select(mnesia_gvar, [ { {{rabbit_user, wild_pattern}, '\\\$1'}, [], ['\\\$1'] } ]),
+			UsersSelectPattern = case WildPattern of
+				%% Version < 3.6.0
+				{internal_user,'_','_','_'} -> {internal_user, '\\\$1', '_', '_'};
+				%% Version >= 3.6.0
+				{internal_user,'_','_','_','_'} -> {internal_user, '\\\$1', '_', '_', '_'}
+			end,
+			Backup(rabbit_user, UsersSelectPattern, {'/=', '\\\$1', <<\"guest\">>}, \"$BaseDataDir/users.erl\"),
+
+			%% Backup user permissions
+			Backup(rabbit_user_permission, {'\\\$1', {'\\\$2', '\\\$3','\\\$4'}, '\\\$5'}, {'/=', '\\\$3', <<\"guest\">>}, \"$BaseDataDir/users_perms.erl\"),
+
+			%% Backup policies
+			Backup(rabbit_runtime_parameters, {runtime_parameters, {'_', '\\\$1', '_'}, '_'}, {'==', '\\\$1', <<\"policy\">>}, \"$BaseDataDir/policies.erl\")
+		end.
+	"
+
+	rmq_monitor
+	if [ $? -eq $OCF_NOT_RUNNING ]; then
+		return $OCF_SUCCESS
+	fi
+
+	$RMQ_CTL stop
+	rc=$?
+
+	if [ $rc -ne 0 ]; then
+		ocf_log err "rabbitmq-server stop command failed: $RMQ_CTL stop, $rc"
+		return $rc
+	fi
+
+	#TODO add kill logic
+	stop_wait=1
+	while [ $stop_wait = 1 ]; do
+		rmq_monitor
+		rc=$?
+		if [ "$rc" -eq $OCF_NOT_RUNNING ]; then
+			stop_wait=0
+			break
+		elif [ "$rc" -ne $OCF_SUCCESS ]; then
+			ocf_log info "rabbitmq-server stop failed: $rc"
+			exit $OCF_ERR_GENERIC
+		fi
+		sleep 1
+	done
+
+	remove_pid
+	return $OCF_SUCCESS
+}
+
+rmq_validate() {
+	check_binary $RMQ_SERVER
+	check_binary $RMQ_CTL
+
+	# This resource only makes sense as a clone right now. at some point
+	# we may want to verify the following.
+	#TODO verify cloned
+	#TODO verify ordered=true
+
+	# Given that this resource does the cluster join explicitly,
+	# having a cluster_nodes list in the static config file will
+	# likely conflict with this agent. 
+	#TODO verify no cluster list in rabbitmq conf
+	#cat /etc/rabbitmq/rabbitmq.config | grep "cluster_nodes"
+
+	return $OCF_SUCCESS
+}
+
+case $__OCF_ACTION in
+meta-data)	meta_data
+		exit $OCF_SUCCESS
+		;;
+start)		rmq_start;;
+stop)		rmq_stop;;
+monitor)	rmq_monitor;;
+validate-all)	rmq_validate;;
+notify)		rmq_notify;;
+usage|help)	rmq_usage
+		exit $OCF_SUCCESS
+		;;
+*)		rmq_usage
+		exit $OCF_ERR_UNIMPLEMENTED
+		;;
+esac
+rc=$?
+ocf_log debug "${OCF_RESOURCE_INSTANCE} $__OCF_ACTION : $rc"
+exit $rc
+

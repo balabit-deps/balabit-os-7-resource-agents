@@ -1,0 +1,14 @@
+language: bash
+sudo: false
+
+addons:
+  apt:
+    #sources:
+    #  - debian-sid
+    packages:
+      - libxml2-utils
+      - shellcheck
+script:
+  - ./ci/build.sh
+notifications:
+  email: false
