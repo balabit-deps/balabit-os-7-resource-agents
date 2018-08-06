@@ -1,3 +1,9 @@
+resource-agents (1:4.1.0~rc1-1ubuntu1bb1) bionic; urgency=medium
+
+  * Balabit patched version
+
+ -- Balabit Platform Team <devnull@dev.null>  Mon, 06 Aug 2018 13:33:24 +0200
+
 resource-agents (1:4.1.0~rc1-1ubuntu1) bionic; urgency=medium
 
   * fix autopkgtests (LP: #1734148)
