@@ -1,0 +1,62 @@
+From 40d05029ce0b2ad437377cf9a8bcb4c91508fa89 Mon Sep 17 00:00:00 2001
+From: "Heitor R. Alves de Siqueira" <halves@canonical.com>
+Date: Thu, 21 Mar 2019 16:29:33 -0300
+Subject: [PATCH] ethmonitor: check if interface exists by link
+
+This patch changes the '-f inet' parameter to '-f link' so that all
+interfaces are listed correctly in the is_interface() function. Since
+this changes output from 'ip' slightly, we also remove a trailing
+semicolon from the interface name.
+
+The is_interface() function in ethmonitor tries to match an interface
+to a list obtained from the 'ip' tool. It lists interfaces using the
+'inet' family, which omits interfaces that don't have an IP address
+assigned:
+
+$ ip -a -o -f inet addr show | cut -d ' ' -f2 | sort -u \
+  | grep -v '^ipsec[0-9][0-9]*$'
+lo
+lxdbr0
+tun0
+virbr0
+wlp3s0
+
+If the interface that we're looking for is e.g. a VLAN bridge that does
+not have an IP address, it won't show up in the listing and
+is_interface() will return false. If we list available interfaces by
+link instead, we also get the ones that don't currently have an
+address:
+
+$ ip -a -o -f link addr show | cut -d ' ' -f2 | sort -u \
+  | grep -v '^ipsec[0-9][0-9]*$' | tr -d ':'
+enp0s31f6
+lo
+lxdbr0
+tun0
+vethSW7OU3@if37
+virbr0
+virbr0-nic
+vnet0
+wlp3s0
+
+Origin: upstream, https://github.com/ClusterLabs/resource-agents/commit/40d05029ce0b
+Bug-Ubuntu: https://bugs.launchpad.net/bugs/1825250
+---
+ heartbeat/ethmonitor | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+Index: resource-agents-4.1.0~rc1/heartbeat/ethmonitor
+===================================================================
+--- resource-agents-4.1.0~rc1.orig/heartbeat/ethmonitor
++++ resource-agents-4.1.0~rc1/heartbeat/ethmonitor
+@@ -206,8 +206,8 @@ is_interface() {
+ 	#
+ 	# List interfaces but exclude FreeS/WAN ipsecN virtual interfaces
+ 	#
+-	local iface=`$IP2UTIL -o -f inet addr show | grep " $1 " \
+-		| cut -d ' ' -f2 | sort -u | grep -v '^ipsec[0-9][0-9]*$'`
++	local iface=`$IP2UTIL -o -f link addr show | grep " $1 " \
++		| cut -d ' ' -f2 | tr -d ':' | sort -u | grep -v '^ipsec[0-9][0-9]*$'`
+ 		[ "$iface" != "" ]
+ }
+ 
