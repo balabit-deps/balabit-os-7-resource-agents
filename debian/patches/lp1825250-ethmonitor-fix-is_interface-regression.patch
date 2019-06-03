@@ -1,0 +1,28 @@
+From c0ac191c73f1a3cf62d54b7ec59992997cca3810 Mon Sep 17 00:00:00 2001
+From: Heitor Alves de Siqueira <halves@canonical.com>
+Date: Wed, 17 Apr 2019 17:16:39 -0300
+Subject: [PATCH] ethmonitor: fix is_interface() regression
+
+Commit 40d05029ce0b changed is_interface() to list by link instead of
+address. We need to adjust the grep filter for the new output format,
+else we'll miss interfaces.
+
+Origin: upstream, https://github.com/ClusterLabs/resource-agents/commit/c0ac191c73f1
+Bug-Ubuntu: https://bugs.launchpad.net/bugs/1825250
+---
+ heartbeat/ethmonitor | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+Index: resource-agents-4.1.0~rc1/heartbeat/ethmonitor
+===================================================================
+--- resource-agents-4.1.0~rc1.orig/heartbeat/ethmonitor
++++ resource-agents-4.1.0~rc1/heartbeat/ethmonitor
+@@ -206,7 +206,7 @@ is_interface() {
+ 	#
+ 	# List interfaces but exclude FreeS/WAN ipsecN virtual interfaces
+ 	#
+-	local iface=`$IP2UTIL -o -f link addr show | grep " $1 " \
++	local iface=`$IP2UTIL -o -f link addr show | grep " $1:" \
+ 		| cut -d ' ' -f2 | tr -d ':' | sort -u | grep -v '^ipsec[0-9][0-9]*$'`
+ 		[ "$iface" != "" ]
+ }

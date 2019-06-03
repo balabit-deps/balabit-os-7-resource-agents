@@ -1,3 +1,14 @@
+resource-agents (1:4.1.0~rc1-1ubuntu1.1) bionic; urgency=medium
+
+  * Fix heartbeat/ethmonitor not listing network interfaces without IP
+    addresses (LP: #1825250). Fixed by upstream patches:
+    - d/p/lp1825250-ethmonitor-check-if-interface-exists-by-link.patch:
+      ethmonitor: check if interface exists by link
+    - d/p/lp1825250-ethmonitor-fix-is_interface-regression.patch:
+      ethmonitor: fix is_interface() regression
+
+ -- Heitor Alves de Siqueira <halves@canonical.com>  Tue, 23 Apr 2019 14:12:58 -0300
+
 resource-agents (1:4.1.0~rc1-1ubuntu1bb1) bionic; urgency=medium
 
   * Balabit patched version

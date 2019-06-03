@@ -7,3 +7,5 @@ xen-toolstack.patch
 gitignore.patch
 reproducible.patch
 SSBM-332-heartbeat.patch
+lp1825250-ethmonitor-check-if-interface-exists-by-link.patch
+lp1825250-ethmonitor-fix-is_interface-regression.patch
