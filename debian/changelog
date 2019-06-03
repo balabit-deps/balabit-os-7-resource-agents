@@ -1,3 +1,9 @@
+resource-agents (1:4.1.0~rc1-1ubuntu1.1bb1) bionic; urgency=medium
+
+  * Balabit patched version
+
+ -- Balabit Platform Team <devnull@dev.null>  Mon, 03 Jun 2019 14:07:42 +0200
+
 resource-agents (1:4.1.0~rc1-1ubuntu1.1) bionic; urgency=medium
 
   * Fix heartbeat/ethmonitor not listing network interfaces without IP
