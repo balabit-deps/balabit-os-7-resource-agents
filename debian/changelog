@@ -1,3 +1,9 @@
+resource-agents (1:4.1.0~rc1-1ubuntu1.2bb1) bionic; urgency=medium
+
+  * Balabit patched version
+
+ -- Balabit Platform Team <devnull@dev.null>  Sat, 31 Aug 2019 04:22:03 +0200
+
 resource-agents (1:4.1.0~rc1-1ubuntu1.2) bionic; urgency=medium
 
   * d/p/lvm-fix-missing-dash.patch:
