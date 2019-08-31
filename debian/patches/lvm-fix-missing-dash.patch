@@ -1,0 +1,17 @@
+Description: LVM: fix missing dash
+Author: Oyvind Albrigtsen <oalbrigt@redhat.com>
+Origin: upstream, https://github.com/ClusterLabs/resource-agents/commit/5a664525a20d3d5094912322be4faac668e4920e
+Bug-Ubuntu: https://launchpad.net/bugs/1839366
+Index: resource-agents-4.1.0~rc1/heartbeat/lvm-tag.sh
+===================================================================
+--- resource-agents-4.1.0~rc1.orig/heartbeat/lvm-tag.sh
++++ resource-agents-4.1.0~rc1/heartbeat/lvm-tag.sh
+@@ -147,7 +147,7 @@ lvm_init() {
+ 	if [ -n "$OCF_RESKEY_tag" ]; then
+ 		OUR_TAG=$OCF_RESKEY_tag
+ 	fi
+-	vgchange_activate_options="aly --config activation{volume_list=[\"@${OUR_TAG}\"]}"
++	vgchange_activate_options="-aly --config activation{volume_list=[\"@${OUR_TAG}\"]}"
+ 	vgchange_deactivate_options="-aln"
+ }
+ 
