@@ -1,7 +1,8 @@
 Source: resource-agents
 Section: admin
 Priority: optional
-Maintainer: Debian HA Maintainers <debian-ha-maintainers@lists.alioth.debian.org>
+Maintainer: Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>
+XSBC-Original-Maintainer: Debian HA Maintainers <debian-ha-maintainers@lists.alioth.debian.org>
 Uploaders: Adrian Vondendriesch <adrian.vondendriesch@credativ.de>,
            Valentin Vidic <Valentin.Vidic@CARNet.hr>
 Build-Depends: autoconf,

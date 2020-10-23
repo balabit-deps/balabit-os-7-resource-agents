@@ -1,0 +1,59 @@
+Description: azure-lb: Don't redirect nc listener output to pidfile
+
+The `lb_start()` function spawns an `nc` listener background process
+and echoes the resulting pid to `$pidfile`. Due to a bug in the
+redirection, all future data received by the `nc` process is also
+appended to `$pidfile`.
+
+If binary data is received later and appended to `$pidfile`, the
+monitor operation fails when `grep` searches the now-binary file.
+
+```
+line 97: kill: Binary: arguments must be process or job IDs ]
+line 97: kill: file: arguments must be process or job IDs ]
+line 97: kill: /var/run/nc_PF2_02.pid: arguments must be process or job
+    IDs ]
+line 97: kill: matches: arguments must be process or job IDs ]
+```
+
+Then the start operation fails during recovery. `lb_start()` spawns a
+new `nc` process, but the old process is still running and using the
+configured port.
+
+```
+nc_PF2_02_start_0:777:stderr [ Ncat: bind to :::62502: Address
+    already in use. QUITTING. ]
+```
+
+This patch fixes the issue by removing the `nc &` command from the
+section whose output gets redirected to `$pidfile`. Now, only the `nc`
+PID is echoed to `$pidfile`.
+
+Resolves: RHBZ#1850778
+Resolves: RHBZ#1850779
+
+Author: Reid Wahl <nrwahl@protonmail.com>
+Origin: upstream, https://github.com/ClusterLabs/resource-agents/commit/d22700fc
+Reviewed-by: Rafael David Tinoco <rafaeldtinoco@ubuntu.com>
+Last-Update: 2020-10-23
+---
+ heartbeat/azure-lb | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/heartbeat/azure-lb b/heartbeat/azure-lb
+index 81fbc62..b35fc2c 100755
+--- a/heartbeat/azure-lb
++++ b/heartbeat/azure-lb
+@@ -103,7 +103,8 @@ lb_start() {
+ 	if ! lb_monitor; then
+ 		ocf_log debug "Starting $process: $cmd"
+ 		# Execute the command as created above
+-		eval "$cmd & echo \$!" > $pidfile
++		$cmd &
++		echo $! > $pidfile
+ 		if lb_monitor; then
+ 			ocf_log debug "$process: $cmd started successfully, calling monitor"
+ 			lb_monitor
+-- 
+2.17.1
+

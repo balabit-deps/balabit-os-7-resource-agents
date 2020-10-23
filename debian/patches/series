@@ -9,3 +9,5 @@ reproducible.patch
 lp1825250-ethmonitor-check-if-interface-exists-by-link.patch
 lp1825250-ethmonitor-fix-is_interface-regression.patch
 lvm-fix-missing-dash.patch
+lp1895343-01-azure-lb-new-resource-agent.patch
+lp1895343-02-azure-lb-Dont-redirect-nc-listener-output-to-pidfile.patch
