@@ -1,3 +1,9 @@
+resource-agents (1:4.1.0~rc1-1ubuntu1.3bb1) bionic; urgency=medium
+
+  * Balabit patched version
+
+ -- Balabit Platform Team <devnull@dev.null>  Tue, 26 Jan 2021 23:02:37 +0100
+
 resource-agents (1:4.1.0~rc1-1ubuntu1.3) bionic; urgency=medium
 
   * Microsoft Azure HA Enablement: azure-lb (LP: #1895343)
