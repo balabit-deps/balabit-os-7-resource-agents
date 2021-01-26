@@ -1,3 +1,11 @@
+resource-agents (1:4.1.0~rc1-1ubuntu1.3) bionic; urgency=medium
+
+  * Microsoft Azure HA Enablement: azure-lb (LP: #1895343)
+    - d/p/lp1895343-01-azure-lb-new-resource-agent.patch
+    - d/p/lp1895343-02-azure-lb-Dont-redirect-nc-listener-output-to-pidfile.patch
+
+ -- Rafael David Tinoco <rafaeldtinoco@ubuntu.com>  Fri, 23 Oct 2020 18:41:22 +0000
+
 resource-agents (1:4.1.0~rc1-1ubuntu1.2bb1) bionic; urgency=medium
 
   * Balabit patched version
